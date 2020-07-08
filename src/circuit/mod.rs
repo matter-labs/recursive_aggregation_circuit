@@ -39,6 +39,8 @@ pub struct RecursiveAggregationCircuit<
     pub aux_data: AD,
     pub transcript_params: &'a T::Params,
 
+    pub g2_elements: Option<[E::G2Affine; 2]>,
+
     _m: std::marker::PhantomData<WP>,
 }
 
@@ -142,7 +144,7 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
             sponge.absorb_single_value(cs, w, self.rescue_params)?;
         }
 
-        let aggregation_challenge = sponge.squeeze_out_single(cs, self.rescue_params)?;
+        let aggregation_challenge = sponge.squeeze_out_single(cs, self.rescue_params)?.into_allocated_num(cs)?;
 
         dbg!(aggregation_challenge.get_value());
 
@@ -154,7 +156,7 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
         for proof_idx in 0..self.num_proofs_to_check {
             let proof = &proof_witnesses[proof_idx];
             let vk = &vk_witnesses[proof_idx];
-            let [pair_with_generator, pair_with_x] = aggregate_proof::<_, _, T, _, _, _, _, _>(
+            let [pair_with_generator, pair_with_x] = aggregate_proof::<_, _, T, CS::Params, P, _, _>(
                 cs,
                 self.transcript_params,
                 &proof.input_values,
@@ -176,15 +178,31 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
         let mut current = aggregation_challenge.clone();
         for _ in 1..self.num_proofs_to_check {
             let new = current.mul(cs, &aggregation_challenge)?;
-            scalars.push(new);
+            scalars.push(new.clone());
 
             current = new;
         }
 
         // perform final aggregation
 
-        let pair_with_generator = WP::multiexp(cs, &scalars, pairs_for_generator, None, self.rns_params, self.aux_data)?;
-        let pair_with_x = WP::multiexp(cs, &scalars, pairs_for_x, None, self.rns_params, self.aux_data)?;
+        let pair_with_generator = WP::multiexp(cs, &scalars, &pairs_for_generator, None, self.rns_params, &self.aux_data)?;
+        let pair_with_x = WP::multiexp(cs, &scalars, &pairs_for_x, None, self.rns_params, &self.aux_data)?;
+
+        match (pair_with_generator.get_point().get_value(), pair_with_x.get_point().get_value(), self.g2_elements) {
+            (Some(with_gen), Some(with_x), Some(g2_elements)) => {
+                use franklin_crypto::bellman::pairing::ff::Field;
+
+                let valid = E::final_exponentiation(
+                    &E::miller_loop(&[
+                        (&with_gen.prepare(), &g2_elements[0].prepare()),
+                        (&with_x.prepare(), &g2_elements[1].prepare())
+                    ])
+                ).unwrap() == E::Fqk::one();
+
+                assert!(valid);
+            },
+            _ => {}
+        }
 
         Ok(())
     }
