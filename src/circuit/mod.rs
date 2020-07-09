@@ -41,7 +41,7 @@ pub struct RecursiveAggregationCircuit<
 
     pub g2_elements: Option<[E::G2Affine; 2]>,
 
-    _m: std::marker::PhantomData<WP>,
+    pub _m: std::marker::PhantomData<WP>,
 }
 
 impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: AuxData<E>, T: ChannelGadget<E>> Circuit<E> 
@@ -77,6 +77,11 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
         for proof_index in 0..self.num_proofs_to_check {
             let proof_witness = self.proofs.as_ref().map(|el| el[proof_index].clone());
 
+            if let Some(proof) = proof_witness.as_ref() {
+                assert_eq!(proof.input_values.len(), self.num_inputs, "proof has too many inputs");
+                // assert!(proof.input_values.len() <= self.num_inputs, "proof has too many inputs");
+            }
+
             let allocated_proof = ProofGadget::<E, WP>::alloc_from_witness(
                 cs, 
                 self.num_inputs, 
@@ -102,7 +107,13 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
 
             let mut allocated = vec![];
 
-            for idx in 0..VerificationKey::<E, P>::witness_size_for_params(self.rns_params) {
+            let expected_witness_size = VerificationKey::<E, P>::witness_size_for_params(self.rns_params);
+
+            if let Some(vk_witness) = vk_witness.as_ref() {
+                assert_eq!(vk_witness.len(), expected_witness_size, "witness size is not sufficient to create verification key");
+            }
+
+            for idx in 0..expected_witness_size {
                 let wit = vk_witness.as_ref().map(|el| el[idx]);
                 let num = AllocatedNum::alloc(
                     cs,
@@ -144,9 +155,9 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
             sponge.absorb_single_value(cs, w, self.rescue_params)?;
         }
 
-        let aggregation_challenge = sponge.squeeze_out_single(cs, self.rescue_params)?.into_allocated_num(cs)?;
+        sponge.pad_if_necessary(self.rescue_params)?;
 
-        dbg!(aggregation_challenge.get_value());
+        let aggregation_challenge = sponge.squeeze_out_single(cs, self.rescue_params)?.into_allocated_num(cs)?;
 
         // then perform individual aggregation
 
@@ -165,6 +176,9 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
                 &self.aux_data,
                 self.rns_params,
             )?;
+
+            dbg!(pair_with_generator.get_point().get_value());
+            dbg!(pair_with_x.get_point().get_value());
 
             pairs_for_generator.push(pair_with_generator);
             pairs_for_x.push(pair_with_x);
@@ -199,11 +213,201 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
                     ])
                 ).unwrap() == E::Fqk::one();
 
-                assert!(valid);
+                dbg!(valid);
+                // assert!(valid);
             },
             _ => {}
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use franklin_crypto::plonk::circuit::verifier_circuit::test::*;
+    use franklin_crypto::bellman::pairing::bn256::{Bn256, Fr};
+    use franklin_crypto::bellman::pairing::ff::*;
+    use franklin_crypto::plonk::circuit::*;
+
+    use franklin_crypto::bellman::pairing::{
+        Engine,
+        CurveAffine,
+        CurveProjective
+    };
+
+    use franklin_crypto::bellman::pairing::ff::{
+        Field,
+        PrimeField,
+        BitIterator,
+        ScalarEngine,
+    };
+
+    use franklin_crypto::bellman::{
+        SynthesisError,
+    };
+
+    use franklin_crypto::bellman::plonk::better_better_cs::cs::{
+        Variable, 
+        ConstraintSystem,
+    };
+
+    use franklin_crypto::bellman::plonk::better_cs::keys::{Proof, VerificationKey, SetupPolynomialsPrecomputations, SetupPolynomials};
+    use franklin_crypto::bellman::plonk::better_cs::cs::PlonkConstraintSystemParams as OldCSParams;
+    use franklin_crypto::bellman::plonk::better_cs::cs::Circuit as OldCircuit;
+    use franklin_crypto::bellman::plonk::better_cs::cs::ConstraintSystem as OldConstraintSystem;
+    use franklin_crypto::bellman::plonk::better_cs::cs::PlonkCsWidth4WithNextStepParams as OldActualParams;
+    use franklin_crypto::bellman::plonk::better_cs::generator::GeneratorAssembly as OldAssembly;
+    use franklin_crypto::bellman::plonk::better_cs::generator::GeneratorAssembly4WithNextStep as OldActualAssembly;
+    use franklin_crypto::bellman::plonk::better_cs::prover::ProverAssembly as OldProver;
+    use franklin_crypto::bellman::plonk::better_cs::prover::ProverAssembly4WithNextStep as OldActualProver;
+
+
+    use franklin_crypto::bellman::plonk::better_cs::verifier::verify_and_aggregate;
+    use franklin_crypto::bellman::worker::*;
+    use franklin_crypto::bellman::plonk::commitments::transcript::*;
+    use franklin_crypto::bellman::kate_commitment::*;
+    use franklin_crypto::bellman::plonk::fft::cooley_tukey_ntt::*;
+    use franklin_crypto::bellman::plonk::better_better_cs::cs::{
+        TrivialAssembly, 
+        Circuit, 
+        PlonkCsWidth4WithNextStepParams, 
+        Width4MainGateWithDNext
+    };
+
+    use franklin_crypto::plonk::circuit::curve::sw_affine::*;
+    use franklin_crypto::plonk::circuit::verifier_circuit::affine_point_wrapper::without_flag_unchecked::*;
+    use franklin_crypto::plonk::circuit::bigint::field::*;
+    use franklin_crypto::plonk::circuit::rescue::*;
+    use franklin_crypto::rescue::RescueEngine;
+    use franklin_crypto::rescue::bn256::*;
+    use franklin_crypto::rescue::rescue_transcript::RescueTranscriptForRNS;
+    use franklin_crypto::bellman::plonk::commitments::transcript::Transcript;
+    
+    #[test]
+    fn test_two_proofs() {
+        let a = Fr::one();
+        let b = Fr::one();
+    
+        let num_steps = 40;
+        let circuit_0 = BenchmarkCircuit::<Bn256> {
+            num_steps,
+            a,
+            b,
+            output: fibbonacci(&a, &b, num_steps),
+            _engine_marker: std::marker::PhantomData,
+        };
+
+        let num_steps = 18;
+
+        let circuit_1 = BenchmarkCircuit::<Bn256> {
+            num_steps,
+            a,
+            b,
+            output: fibbonacci(&a, &b, num_steps),
+            _engine_marker: std::marker::PhantomData,
+        };
+
+        let rns_params = RnsParameters::<Bn256, <Bn256 as Engine>::Fq>::new_for_field(68, 110, 4);
+        let rescue_params = Bn256RescueParams::new_checked_2_into_1();
+
+        let transcript_params = (&rescue_params, &rns_params);
+
+        let (vk_0, proof_0) = make_vk_and_proof::<Bn256, RescueTranscriptForRNS<Bn256>>(circuit_0, transcript_params);
+        let (vk_1, proof_1) = make_vk_and_proof::<Bn256, RescueTranscriptForRNS<Bn256>>(circuit_1, transcript_params);
+
+        let worker = Worker::new();
+        let crs_mons = Crs::<Bn256, CrsForMonomialForm>::crs_42(32, &worker);
+
+        let mut g2_bases = [<<Bn256 as Engine>::G2Affine as CurveAffine>::zero(); 2];
+        g2_bases.copy_from_slice(&crs_mons.g2_monomial_bases.as_ref()[..]);
+
+        let aux_data = BN256AuxData::new();
+
+        let recursive_circuit = RecursiveAggregationCircuit::<Bn256, OldActualParams, WrapperUnchecked<Bn256>, _, RescueChannelGadget<Bn256>>
+        {
+            num_proofs_to_check: 2,
+            num_inputs: 3,
+            vk_tree_depth: 1,
+            vk_root: None,
+            vk_witnesses: Some(vec![vk_0, vk_1]),
+            proof_ids: None,
+            proofs: Some(vec![proof_0, proof_1]),
+            rescue_params: &rescue_params,
+            rns_params: &rns_params,
+            aux_data,
+            transcript_params: &rescue_params,
+        
+            g2_elements: Some(g2_bases),
+        
+            _m: std::marker::PhantomData,
+        };
+
+        let mut cs = TrivialAssembly::<Bn256, Width4WithCustomGates, Width4MainGateWithDNext>::new();
+        recursive_circuit.synthesize(&mut cs).expect("should synthesize");
+        println!("Raw number of gates: {}", cs.n());
+        cs.finalize();
+        println!("Padded number of gates: {}", cs.n());
+        assert!(cs.is_satisfied());
+    }
+
+    fn make_vk_and_proof<'a, E: Engine, T: Transcript<E::Fr>>(
+        circuit: BenchmarkCircuit<E>, 
+        transcript_params: <T as Prng<E::Fr>>::InitializationParameters,
+    ) -> (VerificationKey<E, OldActualParams>, Proof<E, OldActualParams>) {
+        let worker = Worker::new();
+        let mut assembly = OldActualAssembly::<E>::new();
+        circuit.clone().synthesize(&mut assembly).expect("should synthesize");
+        assembly.finalize();
+        let setup = assembly.setup(&worker).expect("should setup");
+
+        let crs_mons = Crs::<E, CrsForMonomialForm>::crs_42(setup.permutation_polynomials[0].size(), &worker);
+        let crs_vals = Crs::<E, CrsForLagrangeForm>::crs_42(setup.permutation_polynomials[0].size(), &worker);
+
+        let verification_key = VerificationKey::from_setup(
+            &setup, 
+            &worker, 
+            &crs_mons
+        ).expect("should create vk");
+
+        let precomputations = SetupPolynomialsPrecomputations::from_setup(
+            &setup, 
+            &worker
+        ).expect("should create precomputations");
+
+        let mut prover = OldActualProver::<E>::new();
+        circuit.synthesize(&mut prover).expect("should synthesize");
+        prover.finalize();
+
+        let size = setup.permutation_polynomials[0].size();
+
+        let omegas_bitreversed = BitReversedOmegas::<E::Fr>::new_for_domain_size(size.next_power_of_two());
+        let omegas_inv_bitreversed = 
+            <OmegasInvBitreversed::<E::Fr> as CTPrecomputations::<E::Fr>>::new_for_domain_size(size.next_power_of_two());
+
+        println!("BEFORE PROVE");
+
+        let proof = prover.prove::<T, _, _>(
+            &worker,
+            &setup,
+            &precomputations,
+            &crs_vals,
+            &crs_mons,
+            &omegas_bitreversed,
+            &omegas_inv_bitreversed,
+            Some(transcript_params.clone()),
+        ).expect("should prove");
+
+        println!("DONE");
+
+        let (is_valid, [for_gen, for_x]) = verify_and_aggregate::<_, _, T>(&proof, &verification_key, Some(transcript_params)).expect("should verify");
+
+        assert!(is_valid);
+
+        println!("PROOF IS VALID");
+
+        (verification_key, proof)
     }
 }
