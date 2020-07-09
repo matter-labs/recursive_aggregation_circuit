@@ -1,3 +1,4 @@
+use franklin_crypto::bellman::pairing::ff::*;
 use franklin_crypto::bellman::pairing::*;
 use franklin_crypto::bellman::plonk::better_better_cs::cs::*;
 use franklin_crypto::plonk::circuit::allocated_num::*;
@@ -18,6 +19,9 @@ use franklin_crypto::bellman::plonk::better_cs::generator::make_non_residues;
 use franklin_crypto::bellman::plonk::better_cs::keys::{Proof, VerificationKey};
 use franklin_crypto::bellman::plonk::better_cs::cs::PlonkConstraintSystemParams as OldCSParams;
 
+use franklin_crypto::bellman::plonk::better_better_cs::redshift::binary_tree::*;
+use franklin_crypto::bellman::plonk::better_better_cs::redshift::tree_hash::BinaryTreeHasher;
+
 #[derive(Clone, Debug)]
 pub struct RecursiveAggregationCircuit<
     'a, 
@@ -32,6 +36,7 @@ pub struct RecursiveAggregationCircuit<
     pub vk_tree_depth: usize,
     pub vk_root: Option<E::Fr>,
     pub vk_witnesses: Option<Vec<VerificationKey<E, P>>>,
+    pub vk_auth_paths: Option<Vec<Vec<E::Fr>>>,
     pub proof_ids: Option<Vec<usize>>,
     pub proofs: Option<Vec<Proof<E, P>>>,
     pub rescue_params: &'a E::Params,
@@ -49,9 +54,7 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
     where <<E as RescueEngine>::Params as RescueHashParams<E>>::SBox0: PlonkCsSBox<E>, 
     <<E as RescueEngine>::Params as RescueHashParams<E>>::SBox1: PlonkCsSBox<E>    
 {
-    fn synthesize<CS: ConstraintSystem<E>>(&self, cs: &mut CS) -> Result<(), SynthesisError> 
-    { 
-        // let num_possible_vks = 1 << self.vk_tree_depth;
+    fn synthesize<CS: ConstraintSystem<E>>(&self, cs: &mut CS) -> Result<(), SynthesisError> { 
         let num_bits_in_proof_id = self.vk_tree_depth;
 
         let non_residues = make_non_residues::<E::Fr>(P::STATE_WIDTH - 1);
@@ -66,6 +69,10 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
 
         if let Some(vk_witnesses) = self.vk_witnesses.as_ref() {
             assert_eq!(self.num_proofs_to_check, vk_witnesses.len());
+        }
+
+        if let Some(vk_auth_paths) = self.vk_auth_paths.as_ref() {
+            assert_eq!(self.num_proofs_to_check, vk_auth_paths.len());
         }
 
         // Allocate everything, get fs scalar for aggregation
@@ -177,9 +184,6 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
                 self.rns_params,
             )?;
 
-            dbg!(pair_with_generator.get_point().get_value());
-            dbg!(pair_with_x.get_point().get_value());
-
             pairs_for_generator.push(pair_with_generator);
             pairs_for_x.push(pair_with_x);
         }
@@ -204,8 +208,6 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
 
         match (pair_with_generator.get_point().get_value(), pair_with_x.get_point().get_value(), self.g2_elements) {
             (Some(with_gen), Some(with_x), Some(g2_elements)) => {
-                use franklin_crypto::bellman::pairing::ff::Field;
-
                 let valid = E::final_exponentiation(
                     &E::miller_loop(&[
                         (&with_gen.prepare(), &g2_elements[0].prepare()),
@@ -219,8 +221,192 @@ impl<'a, E: RescueEngine, P: OldCSParams<E>, WP: WrappedAffinePoint<'a, E>, AD: 
             _ => {}
         }
 
+        {
+            let vk_root = AllocatedNum::alloc(
+                cs,
+                || {
+                    Ok(*self.vk_root.get()?)
+                }
+            )?;
+
+            let mut key_ids = vec![];
+
+            for proof_index in 0..self.num_proofs_to_check {
+                let vk_witness = &vk_leaf_witnesses[proof_index];
+                let path_witness = self.proof_ids.as_ref().map(|el| E::Fr::from_str(&el[proof_index].to_string()).unwrap());
+                let path_allocated = AllocatedNum::alloc(
+                    cs,
+                    || {
+                        Ok(*path_witness.get()?)
+                    }
+                )?;
+
+                let path_bits = path_allocated.into_bits_le(cs, Some(num_bits_in_proof_id))?;
+
+                key_ids.push(path_bits.clone());
+
+                let mut auth_path = vec![];
+                for path_idx in 0..self.vk_tree_depth {
+                    let auth_witness = self.vk_auth_paths.as_ref().map(|el| el[proof_index][path_idx]);
+                    let auth_allocated = AllocatedNum::alloc(
+                        cs,
+                        || {
+                            Ok(*auth_witness.get()?)
+                        }
+                    )?;
+
+                    dbg!(auth_allocated.get_value());
+
+                    auth_path.push(auth_allocated);
+                }
+
+                assert_eq!(auth_path.len(), path_bits.len());
+
+                let leaf_hash = rescue_leaf_hash(cs, vk_witness, self.rescue_params)?;
+
+                let mut current = leaf_hash.clone();
+
+                for (path_bit, auth_path) in path_bits.into_iter().zip(auth_path.into_iter()) {
+                    dbg!(path_bit.get_value());
+
+                    let left = AllocatedNum::conditionally_select(cs, &auth_path, &current, &path_bit)?;
+                    let right = AllocatedNum::conditionally_select(cs, &current, &auth_path, &path_bit)?;
+                    
+                    let node_hash = rescue_node_hash(cs, left, right, self.rescue_params)?;
+
+                    dbg!(node_hash.get_value());
+
+                    current = node_hash;
+                }
+
+                current.enforce_equal(cs, &vk_root)?;
+            }
+        }
+
         Ok(())
     }
+}
+
+fn rescue_leaf_hash<E: RescueEngine, CS: ConstraintSystem<E>>(
+    cs: &mut CS,
+    leaf: &[AllocatedNum<E>], 
+    params: &E::Params
+) -> Result<AllocatedNum<E>, SynthesisError>
+    where <<E as RescueEngine>::Params as RescueHashParams<E>>::SBox0: PlonkCsSBox<E>, 
+     <<E as RescueEngine>::Params as RescueHashParams<E>>::SBox1: PlonkCsSBox<E>  
+{
+    let mut rescue_gadget = StatefulRescueGadget::<E>::new(
+        &params
+    );
+
+    rescue_gadget.specizalize(leaf.len() as u8);
+    rescue_gadget.absorb(cs, leaf, params)?;
+
+    let output = rescue_gadget.squeeze_out_single(cs, params)?;
+
+    let as_num = output.into_allocated_num(cs)?;
+
+    Ok(as_num)
+}
+
+fn rescue_node_hash<E: RescueEngine, CS: ConstraintSystem<E>>(
+    cs: &mut CS,
+    left: AllocatedNum<E>, 
+    right: AllocatedNum<E>,
+    params: &E::Params
+) -> Result<AllocatedNum<E>, SynthesisError>
+    where <<E as RescueEngine>::Params as RescueHashParams<E>>::SBox0: PlonkCsSBox<E>, 
+     <<E as RescueEngine>::Params as RescueHashParams<E>>::SBox1: PlonkCsSBox<E>  
+{
+    let mut rescue_gadget = StatefulRescueGadget::<E>::new(
+        &params
+    );
+
+    rescue_gadget.specizalize(2);
+    rescue_gadget.absorb(cs, &[left, right], params)?;
+
+    let output = rescue_gadget.squeeze_out_single(cs, params)?;
+
+    let as_num = output.into_allocated_num(cs)?;
+
+    Ok(as_num)
+}
+
+
+pub struct RescueBinaryTreeHasher<'a, E: RescueEngine> {
+    params: &'a E::Params,
+}
+
+impl<'a, E: RescueEngine> RescueBinaryTreeHasher<'a, E> {
+    pub fn new(params: &'a E::Params) -> Self {
+        assert_eq!(params.rate(), 2u32);
+        assert_eq!(params.output_len(), 1u32);
+        Self {
+            params: params
+        }
+    }
+}
+
+impl<'a, E: RescueEngine> Clone for RescueBinaryTreeHasher<'a, E> {
+    fn clone(&self) -> Self {
+        Self {
+            params: self.params
+        }
+    }
+}
+
+impl<'a, E: RescueEngine> BinaryTreeHasher<E::Fr> for RescueBinaryTreeHasher<'a, E> {
+    type Output = E::Fr;
+
+    #[inline]
+    fn placeholder_output() -> Self::Output {
+        E::Fr::zero()
+    }
+
+    fn leaf_hash(&self, input: &[E::Fr]) -> Self::Output {
+        let mut as_vec = rescue_hash::<E>(self.params, input);
+
+        as_vec.pop().unwrap()
+    }
+
+    fn node_hash(&self, input: &[Self::Output; 2], _level: usize) -> Self::Output {
+        let mut as_vec = rescue_hash::<E>(self.params, &input[..]);
+
+        as_vec.pop().unwrap()
+    }
+}
+
+fn make_vks_tree<'a, E: RescueEngine, P: OldCSParams<E>>(
+    vks: &[VerificationKey<E, P>],
+    params: &'a E::Params,
+    rns_params: &'a RnsParameters<E, <E::G1Affine as CurveAffine>::Base>,
+) -> (BinaryTree<E, RescueBinaryTreeHasher<'a, E>>, Vec<E::Fr>) {
+    let mut leaf_combinations: Vec<Vec<&[E::Fr]>> = vec![vec![]; vks.len()];
+
+    let hasher = RescueBinaryTreeHasher::new(params);
+    let mut tmp = vec![];
+
+    for vk in vks.iter() {
+        let witness = vk.into_witness_for_params(rns_params).expect("must transform into limbed witness");
+        tmp.push(witness);
+    }
+
+    for idx in 0..vks.len() {
+        leaf_combinations[idx].push(&tmp[idx][..]);
+    }
+
+    let tree_params = BinaryTreeParams {
+        values_per_leaf: VerificationKey::<E, P>::witness_size_for_params(rns_params),
+    };
+
+    let tree = BinaryTree::<E, _>::create_from_combined_leafs(&leaf_combinations[..], 1, hasher, &tree_params);
+
+    let mut all_values = vec![];
+    for w in tmp.into_iter() {
+        all_values.extend(w);
+    }
+
+    (tree, all_values)
 }
 
 #[cfg(test)]
@@ -326,14 +512,40 @@ mod test {
 
         let aux_data = BN256AuxData::new();
 
+        let vks_in_tree = vec![vk_1.clone(), vk_0.clone()];
+        // make in reverse
+        let (vks_tree, all_witness_values) = make_vks_tree(&vks_in_tree, &rescue_params, &rns_params);
+
+        let vks_tree_root = vks_tree.get_commitment();
+        dbg!(vks_tree_root);
+
+        let proof_ids = vec![1, 0];
+
+        let mut queries = vec![];
+        for idx in 0..2 {
+            let proof_id = proof_ids[idx];
+            let vk = &vks_in_tree[proof_id];
+            
+            let leaf_values = vk.into_witness_for_params(&rns_params).expect("must transform into limbed witness");
+
+            let values_per_leaf = leaf_values.len();
+            let intra_leaf_indexes_to_query: Vec<_> = ( (proof_id * values_per_leaf)..( (proof_id + 1) * values_per_leaf)).collect();
+            let q = vks_tree.produce_query(intra_leaf_indexes_to_query, &all_witness_values);
+
+            assert_eq!(q.values(), &leaf_values[..]);
+
+            queries.push(q.path().to_vec());
+        }
+
         let recursive_circuit = RecursiveAggregationCircuit::<Bn256, OldActualParams, WrapperUnchecked<Bn256>, _, RescueChannelGadget<Bn256>>
         {
             num_proofs_to_check: 2,
             num_inputs: 3,
             vk_tree_depth: 1,
-            vk_root: None,
+            vk_root: Some(vks_tree_root),
             vk_witnesses: Some(vec![vk_0, vk_1]),
-            proof_ids: None,
+            vk_auth_paths: Some(queries),
+            proof_ids: Some(proof_ids),
             proofs: Some(vec![proof_0, proof_1]),
             rescue_params: &rescue_params,
             rns_params: &rns_params,
