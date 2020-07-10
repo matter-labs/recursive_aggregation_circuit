@@ -3,6 +3,9 @@ use franklin_crypto::bellman::pairing::*;
 use franklin_crypto::bellman::plonk::better_better_cs::cs::*;
 use franklin_crypto::circuit::Assignment;
 use franklin_crypto::plonk::circuit::allocated_num::*;
+use franklin_crypto::plonk::circuit::linear_combination::*;
+use franklin_crypto::plonk::circuit::boolean::*;
+use franklin_crypto::plonk::circuit::sha256::*;
 use franklin_crypto::plonk::circuit::bigint::field::*;
 use franklin_crypto::plonk::circuit::rescue::*;
 use franklin_crypto::plonk::circuit::verifier_circuit::affine_point_wrapper::aux_data::*;
@@ -47,6 +50,8 @@ pub struct RecursiveAggregationCircuit<
 
     pub _m: std::marker::PhantomData<WP>,
 }
+
+pub const ALLIGN_FIELD_ELEMENTS_TO_BITS: usize = 256;
 
 impl<
         'a,
@@ -253,10 +258,12 @@ where
             _ => {}
         }
 
+        // allocate vk ids
+
+        let mut key_ids = vec![];
+
         {
             let vk_root = AllocatedNum::alloc(cs, || Ok(*self.vk_root.get()?))?;
-
-            let mut key_ids = vec![];
 
             for proof_index in 0..self.num_proofs_to_check {
                 let vk_witness = &vk_leaf_witnesses[proof_index];
@@ -278,8 +285,6 @@ where
                         .map(|el| el[proof_index][path_idx]);
                     let auth_allocated = AllocatedNum::alloc(cs, || Ok(*auth_witness.get()?))?;
 
-                    dbg!(auth_allocated.get_value());
-
                     auth_path.push(auth_allocated);
                 }
 
@@ -290,16 +295,12 @@ where
                 let mut current = leaf_hash.clone();
 
                 for (path_bit, auth_path) in path_bits.into_iter().zip(auth_path.into_iter()) {
-                    dbg!(path_bit.get_value());
-
                     let left =
                         AllocatedNum::conditionally_select(cs, &auth_path, &current, &path_bit)?;
                     let right =
                         AllocatedNum::conditionally_select(cs, &current, &auth_path, &path_bit)?;
 
                     let node_hash = rescue_node_hash(cs, left, right, self.rescue_params)?;
-
-                    dbg!(node_hash.get_value());
 
                     current = node_hash;
                 }
@@ -308,9 +309,107 @@ where
             }
         }
 
+        let mut hash_to_public_inputs = vec![];
+        // first aggregate proof ids into u8
+        for proof_idx in 0..self.num_proofs_to_check {
+            let mut le_bits = key_ids[proof_idx].to_vec();
+            assert!(le_bits.len() < 8);
+            le_bits.resize(8, Boolean::constant(false));
+
+            le_bits.reverse();
+
+            hash_to_public_inputs.extend(le_bits);
+        }   
+
+        // now aggregate original public inputs
+        for proof_idx in 0..self.num_proofs_to_check {
+            let allocated_proof = &proof_witnesses[proof_idx];
+            for input_idx in 0..self.num_inputs {
+                let input = &allocated_proof.input_values[input_idx];
+                let serialized = allocated_num_to_alligned_big_endian(cs, input)?;
+
+                hash_to_public_inputs.extend(serialized);
+            }            
+        }   
+
+        // now serialize field elements as limbs
+
+        hash_to_public_inputs.extend(serialize_point_into_big_endian(cs, &pair_with_generator)?);
+        hash_to_public_inputs.extend(serialize_point_into_big_endian(cs, &pair_with_x)?);
+
+        let input_commitment = sha256(cs, &hash_to_public_inputs)?;
+
+        assert!(input_commitment.len() >= E::Fr::CAPACITY as usize);
+
+        let mut input_bits = input_commitment;
+        input_bits.reverse();
+        input_bits.truncate(E::Fr::CAPACITY as usize);
+        input_bits.reverse();
+
+        let mut lc = LinearCombination::<E>::zero();
+
+        let mut coeff = E::Fr::one();
+
+        for b in input_bits.into_iter() {
+            lc.add_assign_boolean_with_coeff(&b, coeff);
+            coeff.double();
+        }
+
+        let as_num = lc.into_allocated_num(cs)?;
+
+        as_num.inputize(cs)?;
+
         Ok(())
     }
 }
+
+fn allocated_num_to_alligned_big_endian<E: Engine, CS: ConstraintSystem<E>>(
+    cs: &mut CS,
+    el: &AllocatedNum<E>,
+) -> Result<Vec<Boolean>, SynthesisError> {
+    let mut bits = el.into_bits_le(cs, None)?;
+
+    assert!(bits.len() < ALLIGN_FIELD_ELEMENTS_TO_BITS);
+
+    bits.resize(ALLIGN_FIELD_ELEMENTS_TO_BITS, Boolean::constant(false));
+
+    bits.reverse();
+
+    Ok(bits)
+}
+
+fn allocated_num_to_big_endian_of_fixed_width<E: Engine, CS: ConstraintSystem<E>>(
+    cs: &mut CS,
+    el: &AllocatedNum<E>,
+    limit: usize
+) -> Result<Vec<Boolean>, SynthesisError> {
+    let mut bits = el.into_bits_le(cs, Some(limit))?;
+    bits.reverse();
+
+    Ok(bits)
+}
+
+fn serialize_point_into_big_endian<'a, E: Engine, CS: ConstraintSystem<E>, WP: WrappedAffinePoint<'a, E>>(
+    cs: &mut CS,
+    point: &WP
+) -> Result<Vec<Boolean>, SynthesisError> {
+    let raw_point = point.get_point();
+
+    let x = raw_point.get_x().force_reduce_into_field(cs)?.enforce_is_normalized(cs)?;
+    let y = raw_point.get_y().force_reduce_into_field(cs)?.enforce_is_normalized(cs)?;
+
+    let mut serialized = vec![];
+
+    for coord in vec![x, y].into_iter() {
+        for limb in coord.into_limbs().into_iter() {
+            let as_num = limb.into_variable(); // this checks coeff and constant term internally
+            serialized.extend(allocated_num_to_alligned_big_endian(cs, &as_num)?);
+        }
+    }
+
+    Ok(serialized)
+}
+
 
 fn rescue_leaf_hash<E: RescueEngine, CS: ConstraintSystem<E>>(
     cs: &mut CS,
@@ -588,6 +687,7 @@ mod test {
         cs.finalize();
         println!("Padded number of gates: {}", cs.n());
         assert!(cs.is_satisfied());
+        assert_eq!(cs.num_inputs, 1);
     }
 
     fn make_vk_and_proof<'a, E: Engine, T: Transcript<E::Fr>>(
@@ -647,7 +747,7 @@ mod test {
 
         println!("DONE");
 
-        let (is_valid, [for_gen, for_x]) =
+        let (is_valid, [_for_gen, _for_x]) =
             verify_and_aggregate::<_, _, T>(&proof, &verification_key, Some(transcript_params))
                 .expect("should verify");
 
