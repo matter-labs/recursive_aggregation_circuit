@@ -5,7 +5,7 @@ use franklin_crypto::circuit::Assignment;
 use franklin_crypto::plonk::circuit::allocated_num::*;
 use franklin_crypto::plonk::circuit::linear_combination::*;
 use franklin_crypto::plonk::circuit::boolean::*;
-use franklin_crypto::plonk::circuit::sha256::*;
+use franklin_crypto::plonk::circuit::sha256::sha256 as sha256_circuit_hash;
 use franklin_crypto::plonk::circuit::bigint::field::*;
 use franklin_crypto::plonk::circuit::rescue::*;
 use franklin_crypto::plonk::circuit::verifier_circuit::affine_point_wrapper::aux_data::*;
@@ -253,7 +253,6 @@ where
                     == E::Fqk::one();
 
                 dbg!(valid);
-                // assert!(valid);
             }
             _ => {}
         }
@@ -261,10 +260,9 @@ where
         // allocate vk ids
 
         let mut key_ids = vec![];
+        let vk_root = AllocatedNum::alloc(cs, || Ok(*self.vk_root.get()?))?;
 
         {
-            let vk_root = AllocatedNum::alloc(cs, || Ok(*self.vk_root.get()?))?;
-
             for proof_index in 0..self.num_proofs_to_check {
                 let vk_witness = &vk_leaf_witnesses[proof_index];
                 let path_witness = self
@@ -310,6 +308,10 @@ where
         }
 
         let mut hash_to_public_inputs = vec![];
+        // VKs tree
+
+        hash_to_public_inputs.extend(allocated_num_to_alligned_big_endian(cs, &vk_root)?);
+
         // first aggregate proof ids into u8
         for proof_idx in 0..self.num_proofs_to_check {
             let mut le_bits = key_ids[proof_idx].to_vec();
@@ -337,25 +339,25 @@ where
         hash_to_public_inputs.extend(serialize_point_into_big_endian(cs, &pair_with_generator)?);
         hash_to_public_inputs.extend(serialize_point_into_big_endian(cs, &pair_with_x)?);
 
-        let input_commitment = sha256(cs, &hash_to_public_inputs)?;
+        let input_commitment = sha256_circuit_hash(cs, &hash_to_public_inputs)?;
 
-        assert!(input_commitment.len() >= E::Fr::CAPACITY as usize);
-
-        let mut input_bits = input_commitment;
-        input_bits.reverse();
-        input_bits.truncate(E::Fr::CAPACITY as usize);
-        input_bits.reverse();
+        let keep = bytes_to_keep::<E>();
+        assert!(keep <= 32);
+        
+        // we don't need to reverse again
 
         let mut lc = LinearCombination::<E>::zero();
 
         let mut coeff = E::Fr::one();
 
-        for b in input_bits.into_iter() {
-            lc.add_assign_boolean_with_coeff(&b, coeff);
+        for b in input_commitment[(32-keep)*8..].iter().rev() {
+            lc.add_assign_boolean_with_coeff(b, coeff);
             coeff.double();
         }
 
         let as_num = lc.into_allocated_num(cs)?;
+
+        dbg!(as_num.get_value());
 
         as_num.inputize(cs)?;
 
@@ -376,6 +378,33 @@ fn allocated_num_to_alligned_big_endian<E: Engine, CS: ConstraintSystem<E>>(
     bits.reverse();
 
     Ok(bits)
+}
+
+fn debug_print_boolean_array_as_hex(input: &[Boolean]) {
+    assert_eq!(input.len() % 8, 0);
+
+    let mut result = vec![];
+
+    for byte in input.chunks(8) {
+        let mut byte_value = 0u8;
+        for (idx, bit) in byte.iter().enumerate() {
+            if let Some(value) = bit.get_value() {
+                let base = if value {
+                    1u8
+                } else {
+                    0u8
+                };
+
+                byte_value += base << (7-idx);
+            } else {
+                return;
+            }
+        }
+
+        result.push(byte_value);
+    }
+
+    println!("Value = {}", hex::encode(&result));
 }
 
 fn allocated_num_to_big_endian_of_fixed_width<E: Engine, CS: ConstraintSystem<E>>(
@@ -409,7 +438,6 @@ fn serialize_point_into_big_endian<'a, E: Engine, CS: ConstraintSystem<E>, WP: W
 
     Ok(serialized)
 }
-
 
 fn rescue_leaf_hash<E: RescueEngine, CS: ConstraintSystem<E>>(
     cs: &mut CS,
@@ -535,6 +563,148 @@ pub fn make_vks_tree<'a, E: RescueEngine, P: OldCSParams<E>>(
     (tree, all_values)
 }
 
+pub fn make_aggregate<'a, E: RescueEngine, P: OldCSParams<E>>(
+    proofs: &[Proof<E, P>],
+    vks: &[VerificationKey<E, P>],
+    params: &'a E::Params,
+    rns_params: &'a RnsParameters<E, <E::G1Affine as CurveAffine>::Base>,
+) -> Result<[E::G1Affine; 2], SynthesisError> {
+    use franklin_crypto::bellman::plonk::better_cs::verifier::verify_and_aggregate;
+    use franklin_crypto::rescue::rescue_transcript::RescueTranscriptForRNS;
+
+    assert_eq!(proofs.len(), vks.len());
+
+    let mut channel = StatefulRescue::<E>::new(params);
+    for p in proofs.iter() {
+        let as_fe = p.into_witness_for_params(rns_params)?;
+
+        for fe in as_fe.into_iter() {
+            channel.absorb_single_value(fe);
+        }
+    }
+
+    channel.pad_if_necessary();
+
+    let aggregation_challenge: E::Fr = channel.squeeze_out_single();
+
+    let mut pair_with_generator = E::G1::zero();
+    let mut pair_with_x = E::G1::zero();
+
+    let mut current = aggregation_challenge;
+
+    for (vk, proof) in vks.iter().zip(proofs.iter()) {
+        let (is_valid, [for_gen, for_x]) = verify_and_aggregate::<_, _, RescueTranscriptForRNS<E>>(&proof, &vk, Some((params, rns_params)))
+            .expect("should verify");
+
+        assert!(is_valid);
+
+        let contribution = for_gen.mul(current.into_repr());
+        pair_with_generator.add_assign(&contribution);
+
+        let contribution = for_x.mul(current.into_repr());
+        pair_with_x.add_assign(&contribution);
+
+        current.mul_assign(&aggregation_challenge);
+    }
+
+    let pair_with_generator = pair_with_generator.into_affine();
+    let pair_with_x = pair_with_x.into_affine();
+
+    assert!(!pair_with_generator.is_zero());
+    assert!(!pair_with_x.is_zero());
+
+    Ok([pair_with_generator, pair_with_x])
+}
+
+pub fn make_public_input<E: Engine, P: OldCSParams<E>>(
+    vks_root: E::Fr,
+    proof_indexes: &[usize],
+    proofs: &[Proof<E, P>],
+    aggregate: &[E::G1Affine; 2],
+    rns_params: &RnsParameters<E, <E::G1Affine as CurveAffine>::Base>,
+) -> E::Fr {
+    use std::io::Write;
+
+    let input = make_public_input_for_hashing(vks_root, proof_indexes, proofs, aggregate, rns_params);
+
+    let mut hash_output = [0u8; 32];
+
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(&input);
+    let result = hasher.finalize();
+
+    (&mut hash_output[..]).write(&result.as_slice()).expect("must write");
+
+    let keep = bytes_to_keep::<E>();
+    for idx in 0..(32 - keep) {
+        hash_output[idx] = 0;
+    }
+
+    let mut repr = <E::Fr as PrimeField>::Repr::default();
+    repr.read_be(&hash_output[..]).expect("must read BE repr");
+
+    let fe = E::Fr::from_repr(repr).expect("must be valid representation");
+
+    fe
+}
+
+fn make_public_input_for_hashing<E: Engine, P: OldCSParams<E>>(
+    vks_root: E::Fr,
+    proof_indexes: &[usize],
+    proofs: &[Proof<E, P>],
+    aggregate: &[E::G1Affine; 2],
+    rns_params: &RnsParameters<E, <E::G1Affine as CurveAffine>::Base>,
+) -> Vec<u8> {
+    let mut result = vec![];
+
+    add_field_element(&vks_root, &mut result);
+    for idx in proof_indexes.iter() {
+        assert!(*idx < 256);
+        result.push(*idx as u8);
+    }
+
+    for proof in proofs.iter() {
+        for input in proof.input_values.iter() {
+            add_field_element(input, &mut result);
+        }
+    }
+
+    add_point(&aggregate[0], &mut result, rns_params);
+    add_point(&aggregate[1], &mut result, rns_params);
+
+    result
+}
+
+fn bytes_to_keep<E: Engine>() -> usize {
+    (E::Fr::CAPACITY / 8) as usize
+}
+
+fn add_field_element<F: PrimeField>(src: &F, dst: &mut Vec<u8>) {
+    let repr = src.into_repr();
+
+    let mut buffer = [0u8; 32];
+    repr.write_be(&mut buffer[..]).expect("must write");
+
+    dst.extend_from_slice(&buffer);
+}
+
+fn add_point<E: Engine>(src: &E::G1Affine, dst: &mut Vec<u8>, params: &RnsParameters<E, <E::G1Affine as CurveAffine>::Base>) {
+    use franklin_crypto::plonk::circuit::verifier_circuit::utils::*;
+
+    let mut new_params = params.clone();
+    new_params.set_prefer_single_limb_allocation(true);
+
+    let params = &new_params;
+
+    let mut tmp_dest = vec![];
+    add_point(src, &mut tmp_dest, &params);
+
+    for p in tmp_dest.into_iter() {
+        add_field_element(&p, dst);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -630,7 +800,6 @@ mod test {
             make_vks_tree(&vks_in_tree, &rescue_params, &rns_params);
 
         let vks_tree_root = vks_tree.get_commitment();
-        dbg!(vks_tree_root);
 
         let proof_ids = vec![1, 0];
 
@@ -652,6 +821,21 @@ mod test {
 
             queries.push(q.path().to_vec());
         }
+
+        let aggregate = make_aggregate(
+            &vec![proof_0.clone(), proof_1.clone()], 
+            &vec![vk_0.clone(), vk_1.clone()], 
+            &rescue_params,
+            &rns_params
+        ).unwrap();
+
+        let expected_input = make_public_input(
+            vks_tree_root,
+            &proof_ids,
+            &vec![proof_0.clone(), proof_1.clone()],
+            &aggregate,
+            &rns_params
+        );
 
         let recursive_circuit = RecursiveAggregationCircuit::<
             Bn256,

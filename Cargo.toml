@@ -8,3 +8,5 @@ edition = "2018"
 
 [dependencies]
 franklin-crypto = {path = "../franklin-crypto", features = ["multicore"]}
+sha2 = "0.9"
+hex = "*"
