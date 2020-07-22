@@ -23,6 +23,7 @@ use franklin_crypto::bellman::plonk::better_cs::keys::{Proof, VerificationKey};
 
 use franklin_crypto::bellman::plonk::better_better_cs::redshift::binary_tree::*;
 use franklin_crypto::bellman::plonk::better_better_cs::redshift::tree_hash::BinaryTreeHasher;
+use franklin_crypto::plonk::circuit::bigint::range_constraint_gate::TwoBitDecompositionRangecheckCustomGate;
 
 #[derive(Clone, Debug)]
 pub struct RecursiveAggregationCircuit<
@@ -65,6 +66,16 @@ where
     <<E as RescueEngine>::Params as RescueHashParams<E>>::SBox0: PlonkCsSBox<E>,
     <<E as RescueEngine>::Params as RescueHashParams<E>>::SBox1: PlonkCsSBox<E>,
 {
+    type MainGate = Width4MainGateWithDNext;
+
+    fn declare_used_gates() -> Result<Vec<Box<dyn GateInternal<E>>>, SynthesisError> {
+        Ok(
+            vec![
+                Self::MainGate::default().into_internal(),
+                TwoBitDecompositionRangecheckCustomGate::default().into_internal(),
+            ]
+        )
+    }
     fn synthesize<CS: ConstraintSystem<E>>(&self, cs: &mut CS) -> Result<(), SynthesisError> {
         let num_bits_in_proof_id = self.vk_tree_depth;
 
@@ -193,6 +204,7 @@ where
         for proof_idx in 0..self.num_proofs_to_check {
             let proof = &proof_witnesses[proof_idx];
             let vk = &vk_witnesses[proof_idx];
+
             let [pair_with_generator, pair_with_x] = aggregate_proof::<_, _, T, CS::Params, P, _, _>(
                 cs,
                 self.transcript_params,
@@ -357,8 +369,6 @@ where
 
         let as_num = lc.into_allocated_num(cs)?;
 
-        dbg!(as_num.get_value());
-
         as_num.inputize(cs)?;
 
         Ok(())
@@ -482,27 +492,27 @@ where
     Ok(as_num)
 }
 
-pub struct RescueBinaryTreeHasher<'a, E: RescueEngine> {
-    params: &'a E::Params,
+pub struct StaticRescueBinaryTreeHasher<E: RescueEngine> {
+    params: E::Params,
 }
 
-impl<'a, E: RescueEngine> RescueBinaryTreeHasher<'a, E> {
-    pub fn new(params: &'a E::Params) -> Self {
+impl<E: RescueEngine> StaticRescueBinaryTreeHasher<E> {
+    pub fn new(params: &E::Params) -> Self {
         assert_eq!(params.rate(), 2u32);
         assert_eq!(params.output_len(), 1u32);
-        Self { params: params }
+        Self { params: params.clone() }
     }
 }
 
-impl<'a, E: RescueEngine> Clone for RescueBinaryTreeHasher<'a, E> {
+impl<E: RescueEngine> Clone for StaticRescueBinaryTreeHasher<E> {
     fn clone(&self) -> Self {
         Self {
-            params: self.params,
+            params: self.params.clone(),
         }
     }
 }
 
-impl<'a, E: RescueEngine> BinaryTreeHasher<E::Fr> for RescueBinaryTreeHasher<'a, E> {
+impl<E: RescueEngine> BinaryTreeHasher<E::Fr> for StaticRescueBinaryTreeHasher<E> {
     type Output = E::Fr;
 
     #[inline]
@@ -511,13 +521,13 @@ impl<'a, E: RescueEngine> BinaryTreeHasher<E::Fr> for RescueBinaryTreeHasher<'a,
     }
 
     fn leaf_hash(&self, input: &[E::Fr]) -> Self::Output {
-        let mut as_vec = rescue_hash::<E>(self.params, input);
+        let mut as_vec = rescue_hash::<E>(&self.params, input);
 
         as_vec.pop().unwrap()
     }
 
     fn node_hash(&self, input: &[Self::Output; 2], _level: usize) -> Self::Output {
-        let mut as_vec = rescue_hash::<E>(self.params, &input[..]);
+        let mut as_vec = rescue_hash::<E>(&self.params, &input[..]);
 
         as_vec.pop().unwrap()
     }
@@ -527,10 +537,10 @@ pub fn make_vks_tree<'a, E: RescueEngine, P: OldCSParams<E>>(
     vks: &[VerificationKey<E, P>],
     params: &'a E::Params,
     rns_params: &'a RnsParameters<E, <E::G1Affine as CurveAffine>::Base>,
-) -> (BinaryTree<E, RescueBinaryTreeHasher<'a, E>>, Vec<E::Fr>) {
+) -> (BinaryTree<E, StaticRescueBinaryTreeHasher<E>>, Vec<E::Fr>) {
     let mut leaf_combinations: Vec<Vec<&[E::Fr]>> = vec![vec![]; vks.len()];
 
-    let hasher = RescueBinaryTreeHasher::new(params);
+    let hasher = StaticRescueBinaryTreeHasher::new(params);
     let mut tmp = vec![];
 
     for vk in vks.iter() {
@@ -703,6 +713,104 @@ fn add_point<E: Engine>(src: &E::G1Affine, dst: &mut Vec<u8>, params: &RnsParame
     for p in tmp_dest.into_iter() {
         add_field_element(&p, dst);
     }
+}
+
+use franklin_crypto::bellman::plonk::better_better_cs::setup::{
+    VerificationKey as NewVerificationKey, Setup as NewSetup,
+};
+
+use franklin_crypto::bellman::plonk::better_better_cs::cs::{
+    Circuit, SetupAssembly, ProvingAssembly, Width4MainGateWithDNext,
+};
+
+use franklin_crypto::bellman::plonk::better_cs::cs::PlonkCsWidth4WithNextStepParams as OldActualParams;
+use franklin_crypto::plonk::circuit::verifier_circuit::affine_point_wrapper::without_flag_unchecked::WrapperUnchecked;
+use franklin_crypto::bellman::pairing::bn256::Bn256;
+use franklin_crypto::bellman::kate_commitment::*;
+use franklin_crypto::plonk::circuit::Width4WithCustomGates;
+use franklin_crypto::rescue::bn256::Bn256RescueParams;
+
+pub type RecursiveAggregationCircuitBn256<'a> = RecursiveAggregationCircuit::<'a, Bn256, OldActualParams, WrapperUnchecked<'a, Bn256>, BN256AuxData, RescueChannelGadget<Bn256>>;
+
+
+pub fn create_recursive_circuit_setup<'a>(
+    num_proofs_to_check: usize,
+    num_inputs: usize,
+    vk_tree_depth: usize,
+) -> Result<NewSetup<Bn256, RecursiveAggregationCircuitBn256<'a>>, SynthesisError> {
+    let mut assembly = SetupAssembly::<Bn256, Width4WithCustomGates, Width4MainGateWithDNext>::new();
+
+    let rns_params = RnsParameters::<Bn256, <Bn256 as Engine>::Fq>::new_for_field(68, 110, 4);
+    let rescue_params = Bn256RescueParams::new_checked_2_into_1();
+    let aux_data = BN256AuxData::new();
+
+    // let transcript_params = (&rescue_params, &rns_params);
+
+    let recursive_circuit = RecursiveAggregationCircuitBn256 {
+        num_proofs_to_check,
+        num_inputs,
+        vk_tree_depth,
+        vk_root: None,
+        vk_witnesses: None,
+        vk_auth_paths: None,
+        proof_ids: None,
+        proofs: None,
+        rescue_params: &rescue_params,
+        rns_params: &rns_params,
+        aux_data,
+        transcript_params: &rescue_params,
+
+        g2_elements: None,
+
+        _m: std::marker::PhantomData,
+    };
+
+    recursive_circuit.synthesize(&mut assembly)?;
+
+    use franklin_crypto::bellman::worker::*;
+    let worker = Worker::new();
+
+    assembly.finalize();
+    let setup = assembly.create_setup(&worker)?;
+
+    Ok(setup)
+}
+
+pub fn create_recursive_circuit_vk_and_setup<'a>(
+    num_proofs_to_check: usize,
+    num_inputs: usize,
+    vk_tree_depth: usize,
+    crs: &Crs<Bn256, CrsForMonomialForm>,
+) -> Result<(NewVerificationKey<Bn256, RecursiveAggregationCircuitBn256<'a>>, NewSetup<Bn256, RecursiveAggregationCircuitBn256<'a>>), SynthesisError> {
+    use franklin_crypto::bellman::worker::*;
+    let worker = Worker::new();
+
+    let setup = create_recursive_circuit_setup(num_proofs_to_check, num_inputs, vk_tree_depth)?;
+
+    let vk = NewVerificationKey::<Bn256, RecursiveAggregationCircuitBn256<'a>>::from_setup(&setup, &worker, &crs)?;
+
+    Ok((vk, setup))
+}
+
+pub fn create_vks_tree(
+    vks: &[VerificationKey<Bn256, OldActualParams>],
+    tree_depth: usize
+) -> Result<(usize, (BinaryTree<Bn256, StaticRescueBinaryTreeHasher<Bn256>>, Vec<<Bn256 as ScalarEngine>::Fr>)), SynthesisError> {
+    assert!(vks.len() > 0);
+    let max_size = 1 << tree_depth;
+    assert!(vks.len() <= max_size);
+
+    let max_valid_idx = vks.len() - 1;
+
+    let mut padded = vks.to_vec();
+    padded.resize(max_size, vks.last().unwrap().clone());
+
+    let rns_params = RnsParameters::<Bn256, <Bn256 as Engine>::Fq>::new_for_field(68, 110, 4);
+    let rescue_params = Bn256RescueParams::new_checked_2_into_1();
+
+    let (tree, witness) = make_vks_tree(&padded, &rescue_params, &rns_params);
+
+    Ok((max_valid_idx, (tree, witness)))
 }
 
 #[cfg(test)]
@@ -940,5 +1048,241 @@ mod test {
         println!("PROOF IS VALID");
 
         (verification_key, proof)
+    }
+
+    fn open_crs_for_log2_of_size(n: usize) -> Crs::<Bn256, CrsForMonomialForm> {
+        let base_path = std::path::Path::new("/Users/alexvlasov/Downloads/setup/processed");
+        let full_path = base_path.join(&format!("setup_2^{}.key", n));
+        println!("Opening {}", full_path.to_string_lossy());
+        let file = std::fs::File::open(full_path).unwrap();
+        let reader = std::io::BufReader::with_capacity(1 << 24, file);
+
+        let crs = Crs::<Bn256, CrsForMonomialForm>::read(reader).unwrap();
+
+        crs
+    }
+
+    #[test]
+    fn create_vk() {
+        let crs = open_crs_for_log2_of_size(22);
+
+        // let size = 1 << 22;
+        // let worker = Worker::new();
+        // let crs = Crs::<Bn256, CrsForMonomialForm>::crs_42(size, &worker);
+
+        let (vk, _) = create_recursive_circuit_vk_and_setup(2, 1, 3, &crs).unwrap();
+
+        dbg!(vk);
+    }
+
+    fn make_vk_and_proof_for_crs<'a, E: Engine, T: Transcript<E::Fr>>(
+        circuit: BenchmarkCircuitWithOneInput<E>,
+        transcript_params: <T as Prng<E::Fr>>::InitializationParameters,
+        crs: &Crs::<E, CrsForMonomialForm>,
+    ) -> (
+        VerificationKey<E, OldActualParams>,
+        Proof<E, OldActualParams>,
+    ) {
+        let worker = Worker::new();
+        let mut assembly = OldActualAssembly::<E>::new();
+        circuit
+            .synthesize(&mut assembly)
+            .expect("should synthesize");
+        assembly.finalize();
+        let setup = assembly.setup(&worker).expect("should setup");
+
+        let verification_key =
+            VerificationKey::from_setup(&setup, &worker, &crs).expect("should create vk");
+
+        let proof = franklin_crypto::bellman::plonk::prove_native_by_steps::<E, _, T>(
+            &circuit,
+            &setup,
+            None,
+            crs,
+            Some(transcript_params.clone())
+        ).expect("should create a proof");
+
+        let (is_valid, [_for_gen, _for_x]) =
+            verify_and_aggregate::<_, _, T>(&proof, &verification_key, Some(transcript_params))
+                .expect("should verify");
+
+        assert!(is_valid);
+
+        (verification_key, proof)
+    }
+
+    #[test]
+    fn simulate_zksync_proofs() {
+        let a = Fr::one();
+        let b = Fr::one();
+
+        let mut circuits = vec![];
+        for num_steps in vec![18, 40, 25, 35].into_iter() {
+            let circuit = BenchmarkCircuitWithOneInput::<Bn256> {
+                num_steps,
+                a,
+                b,
+                output: fibbonacci(&a, &b, num_steps),
+                _engine_marker: std::marker::PhantomData,
+            };
+
+            circuits.push(circuit);
+        }
+
+
+        let rns_params = RnsParameters::<Bn256, <Bn256 as Engine>::Fq>::new_for_field(68, 110, 4);
+        let rescue_params = Bn256RescueParams::new_checked_2_into_1();
+
+        let transcript_params = (&rescue_params, &rns_params);
+
+        let crs = open_crs_for_log2_of_size(22);
+
+        let mut vks = vec![];
+        let mut proofs = vec![];
+
+        for circuit in circuits.into_iter() {
+            let (vk, proof) =
+                make_vk_and_proof_for_crs::<Bn256, RescueTranscriptForRNS<Bn256>>(circuit, transcript_params, &crs);
+
+            vks.push(vk);
+            proofs.push(proof);
+        }
+
+        let num_inputs = 1;
+        let num_proofs_to_check = 2;
+        let tree_depth = 3;
+
+        let (max_index, (vks_tree, tree_witnesses)) = create_vks_tree(&vks, tree_depth).expect("must create vks tree");
+
+        assert_eq!(max_index, 3);
+
+        let proofs_to_check = vec![2,3];
+
+        let mut queries = vec![];
+
+        let mut proofs_to_aggregate = vec![];
+        let mut vks_to_aggregate = vec![];
+        for &proof_id in proofs_to_check.iter() {
+            let vk = &vks[proof_id];
+            let proof = &proofs[proof_id];
+
+            proofs_to_aggregate.push(proof.clone());
+            vks_to_aggregate.push(vk.clone());
+
+            let leaf_values = vk
+                .into_witness_for_params(&rns_params)
+                .expect("must transform into limbed witness");
+
+            let values_per_leaf = leaf_values.len();
+            let intra_leaf_indexes_to_query: Vec<_> =
+                ((proof_id * values_per_leaf)..((proof_id + 1) * values_per_leaf)).collect();
+            let q = vks_tree.produce_query(intra_leaf_indexes_to_query, &tree_witnesses);
+
+            assert_eq!(q.values(), &leaf_values[..]);
+
+            queries.push(q.path().to_vec());
+        }
+
+        let aggregate = make_aggregate(
+            &proofs_to_aggregate, 
+            &vks_to_aggregate, 
+            &rescue_params,
+            &rns_params
+        ).unwrap();
+
+        let vks_tree_root = vks_tree.get_commitment();
+
+        let expected_input = make_public_input(
+            vks_tree_root,
+            &proofs_to_check,
+            &proofs_to_aggregate,
+            &aggregate,
+            &rns_params
+        );
+
+        println!("MAKING VK FOR RECURSIVE CIRCUIT");
+
+        let (vk_for_recursive_circut, setup) = create_recursive_circuit_vk_and_setup(
+            num_proofs_to_check,
+            num_inputs,
+            tree_depth,
+            &crs,
+        ).expect("must create recursive circuit verification key");
+
+        // let setup = create_recursive_circuit_setup(
+        //     num_proofs_to_check,
+        //     num_inputs,
+        //     tree_depth
+        // ).expect("must create recursive circuit verification key");
+
+        assert_eq!(setup.num_inputs, 1);
+
+        println!("RECURSIVE CIRCUIT VK IS COMPLETE");
+
+        assert_eq!(vk_for_recursive_circut.total_lookup_entries_length, 0);
+
+        let mut g2_bases = [<<Bn256 as Engine>::G2Affine as CurveAffine>::zero(); 2];
+        g2_bases.copy_from_slice(&crs.g2_monomial_bases.as_ref()[..]);
+
+        let aux_data = BN256AuxData::new();
+
+        let recursive_circuit_with_witness = RecursiveAggregationCircuitBn256 {
+            num_proofs_to_check: num_proofs_to_check,
+            num_inputs: num_inputs,
+            vk_tree_depth: tree_depth,
+            vk_root: Some(vks_tree_root),
+            vk_witnesses: Some(vks_to_aggregate),
+            vk_auth_paths: Some(queries),
+            proof_ids: Some(proofs_to_check),
+            proofs: Some(proofs_to_aggregate),
+            rescue_params: &rescue_params,
+            rns_params: &rns_params,
+            aux_data,
+            transcript_params: &rescue_params,
+
+            g2_elements: Some(g2_bases),
+
+            _m: std::marker::PhantomData,
+        };
+
+        // println!("TESTING IF SATISFIED");
+
+        // let mut assembly = TrivialAssembly::<Bn256, Width4WithCustomGates, Width4MainGateWithDNext>::new();
+        // recursive_circuit_with_witness.synthesize(&mut assembly).expect("must synthesize");
+        // assembly.finalize();
+        // assert!(assembly.is_satisfied());
+
+        // println!("DONE TESTING IF SATISFIED");
+    
+        let worker = Worker::new();
+
+        use franklin_crypto::bellman::plonk::commitments::transcript::keccak_transcript::RollingKeccakTranscript;
+
+        println!("MAKING PROOF FOR RECURSIVE CIRCUIT");
+
+        let mut assembly = ProvingAssembly::<Bn256, Width4WithCustomGates, Width4MainGateWithDNext>::new();
+        recursive_circuit_with_witness.synthesize(&mut assembly).expect("must synthesize");
+        assembly.finalize();
+
+        let proof = assembly.create_proof::<_, RollingKeccakTranscript<<Bn256 as ScalarEngine>::Fr>>(
+            &worker, 
+            &setup, 
+            &crs, 
+            None
+        ).expect("must create a proof");
+
+        println!("PROOF FOR RECURSIVE CIRCUIT IS COMPLETE");
+
+        assert_eq!(proof.inputs[0], expected_input, "expected input is not equal to one in a circuit");
+
+        use franklin_crypto::bellman::plonk::better_better_cs::verifier::verify;
+
+        let is_valid = verify::<_, _, RollingKeccakTranscript<<Bn256 as ScalarEngine>::Fr>>(
+            &vk_for_recursive_circut,
+            &proof,
+            None,
+        ).expect("must perform verification");
+
+        assert!(is_valid);
     }
 }
