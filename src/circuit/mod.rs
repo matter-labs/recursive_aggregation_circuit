@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use franklin_crypto::bellman::pairing::ff::*;
 use franklin_crypto::bellman::pairing::*;
 use franklin_crypto::bellman::plonk::better_better_cs::cs::*;
@@ -21,8 +23,8 @@ use franklin_crypto::bellman::plonk::better_cs::cs::PlonkConstraintSystemParams 
 use franklin_crypto::bellman::plonk::better_cs::generator::make_non_residues;
 use franklin_crypto::bellman::plonk::better_cs::keys::{Proof, VerificationKey};
 
-use franklin_crypto::bellman::plonk::better_better_cs::redshift::binary_tree::*;
-use franklin_crypto::bellman::plonk::better_better_cs::redshift::tree_hash::BinaryTreeHasher;
+use franklin_crypto::bellman::plonk::better_better_cs::trees::binary_tree::*;
+use franklin_crypto::bellman::plonk::better_better_cs::trees::tree_hash::BinaryTreeHasher;
 use franklin_crypto::plonk::circuit::bigint::range_constraint_gate::TwoBitDecompositionRangecheckCustomGate;
 
 #[derive(Clone, Debug)]
