@@ -852,12 +852,8 @@ pub fn create_zksync_recursive_aggregate(
     let rns_params = &*RNS_PARAMETERS;
     let rescue_params = &*RESCUE_PARAMETERS;
 
-    let transcript_params = (&rescue_params, &rns_params);
-
-    let num_proofs_to_check = proofs.len();
-
     assert!(tree_depth <= 8, "tree must not be deeper than 8");
-    let (max_index, (vks_tree, tree_witnesses)) = create_vks_tree(&all_known_vks, tree_depth)?;
+    let (max_index, (vks_tree, _)) = create_vks_tree(&all_known_vks, tree_depth)?;
 
     let mut vks_to_aggregate = vec![];
     let mut short_indexes = vec![];
@@ -880,6 +876,16 @@ pub fn create_zksync_recursive_aggregate(
         &rescue_params,
         &rns_params
     )?;
+
+    let valid = Bn256::final_exponentiation(&Bn256::miller_loop(&[
+        (&aggregate[0].prepare(), &g2_elements[0].prepare()),
+        (&aggregate[1].prepare(), &g2_elements[1].prepare()),
+    ])).ok_or(SynthesisError::Unsatisfiable)? == <Bn256 as Engine>::Fqk::one();
+
+    if valid == false {
+        println!("Recursive aggreagete is invalid");
+        return Err(SynthesisError::Unsatisfiable);
+    }
 
     let vks_tree_root = vks_tree.get_commitment();
 
@@ -1182,7 +1188,7 @@ mod test {
             &rns_params
         ).unwrap();
 
-        let (expected_input, _) = make_public_input_and_limbed_aggregate(
+        let (_, _) = make_public_input_and_limbed_aggregate(
             vks_tree_root,
             &proof_ids,
             &vec![proof_0.clone(), proof_1.clone()],
