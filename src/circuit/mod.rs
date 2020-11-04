@@ -15,7 +15,7 @@ use franklin_crypto::plonk::circuit::verifier_circuit::affine_point_wrapper::*;
 use franklin_crypto::plonk::circuit::verifier_circuit::channel::*;
 use franklin_crypto::plonk::circuit::verifier_circuit::data_structs::*;
 use franklin_crypto::plonk::circuit::verifier_circuit::verifying_circuit::aggregate_proof;
-use franklin_crypto::rescue::*;
+use franklin_crypto::rescue::{RescueEngine, RescueHashParams, StatefulRescue, rescue_hash as rescue_hash_out_of_circuit};
 
 use franklin_crypto::bellman::SynthesisError;
 use franklin_crypto::bellman::worker::Worker;
@@ -524,13 +524,13 @@ impl<E: RescueEngine> BinaryTreeHasher<E::Fr> for StaticRescueBinaryTreeHasher<E
     }
 
     fn leaf_hash(&self, input: &[E::Fr]) -> Self::Output {
-        let mut as_vec = rescue_hash::<E>(&self.params, input);
+        let mut as_vec = rescue_hash_out_of_circuit::<E>(&self.params, input);
 
         as_vec.pop().unwrap()
     }
 
     fn node_hash(&self, input: &[Self::Output; 2], _level: usize) -> Self::Output {
-        let mut as_vec = rescue_hash::<E>(&self.params, &input[..]);
+        let mut as_vec = rescue_hash_out_of_circuit::<E>(&self.params, &input[..]);
 
         as_vec.pop().unwrap()
     }
@@ -987,6 +987,8 @@ pub fn proof_recursive_aggregate_for_zksync<'a>(
 
     let vks_tree_root = vks_tree.get_commitment();
 
+    println!("Assembling input to recursive circuit");
+
     let (expected_input, _) = make_public_input_and_limbed_aggregate(
         vks_tree_root,
         &vk_indexes,
@@ -1024,11 +1026,14 @@ pub fn proof_recursive_aggregate_for_zksync<'a>(
     };
 
     if quick_check_if_satisifed {
+        println!("Checking if satisfied");
         let mut assembly = TrivialAssembly::<Bn256, Width4WithCustomGates, Width4MainGateWithDNext>::new();
         recursive_circuit_with_witness.synthesize(&mut assembly).expect("must synthesize");
-        let if_satisfied = assembly.is_satisfied();
+        println!("Using {} gates for {} proofs aggregated", assembly.n(), num_proofs_to_check);
+        let is_satisfied = assembly.is_satisfied();
+        println!("Is satisfied = {}", is_satisfied);
 
-        if if_satisfied == false {
+        if is_satisfied == false {
             return Err(SynthesisError::Unsatisfiable);
         }
     }
@@ -1386,7 +1391,7 @@ mod test {
 
         let transcript_params = (&rescue_params, &rns_params);
 
-        let crs = open_crs_for_log2_of_size(22);
+        let crs = open_crs_for_log2_of_size(24);
 
         let mut vks = vec![];
         let mut proofs = vec![];
@@ -1500,5 +1505,86 @@ mod test {
         ).expect("must perform verification");
 
         assert!(is_valid);
+    }
+
+    #[test]
+    fn simulate_many_proofs() {
+        let a = Fr::one();
+        let b = Fr::one();
+
+        let mut circuits = vec![];
+        for num_steps in vec![18, 40, 25, 35].into_iter() {
+            let circuit = BenchmarkCircuitWithOneInput::<Bn256> {
+                num_steps,
+                a,
+                b,
+                output: fibbonacci(&a, &b, num_steps),
+                _engine_marker: std::marker::PhantomData,
+            };
+
+            circuits.push(circuit);
+        }
+
+
+        let rns_params = RnsParameters::<Bn256, <Bn256 as Engine>::Fq>::new_for_field(68, 110, 4);
+        let rescue_params = Bn256RescueParams::new_checked_2_into_1();
+
+        let transcript_params = (&rescue_params, &rns_params);
+
+        let crs = open_crs_for_log2_of_size(24);
+
+        let mut vks = vec![];
+        let mut proofs = vec![];
+
+        for circuit in circuits.into_iter() {
+            let (vk, proof) =
+                make_vk_and_proof_for_crs::<Bn256, RescueTranscriptForRNS<Bn256>>(circuit, transcript_params, &crs);
+
+            let valid = franklin_crypto::bellman::plonk::better_cs::verifier::verify::<_, _, RescueTranscriptForRNS<Bn256>>(
+                &proof,
+                &vk,
+                Some(transcript_params)
+            ).expect("must verify");
+            assert!(valid);
+
+            vks.push(vk);
+            proofs.push(proof);
+        }
+
+        let num_proofs_limit = 40;
+
+        let num_inputs = 1;
+        let num_proofs_to_check = num_proofs_limit;
+        let tree_depth = 3;
+
+        // this is dummy
+        let (vk_for_recursive_circut, setup) = create_recursive_circuit_vk_and_setup(
+            2,
+            num_inputs,
+            tree_depth,
+            &crs,
+        ).expect("must create recursive circuit verification key");
+
+        let mut proofs_indexes_to_check = vec![2,3];
+        proofs_indexes_to_check.resize(num_proofs_limit, 0);
+
+        let mut proofs_to_check = vec![proofs[2].clone(), proofs[3].clone()];
+        let tmp = proofs[0].clone();
+        proofs_to_check.resize(num_proofs_limit, tmp.clone());
+    
+        let worker = Worker::new();
+
+        let _ = proof_recursive_aggregate_for_zksync(
+            tree_depth, 
+            num_inputs, 
+            &vks, 
+            &proofs_to_check, 
+            &proofs_indexes_to_check, 
+            &vk_for_recursive_circut,
+            &setup,
+            &crs,
+            true,
+            &worker
+        ).expect("must check if satisfied and make a proof");
     }
 }
