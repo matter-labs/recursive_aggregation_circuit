@@ -306,6 +306,8 @@ library TranscriptLibrary {
 
 
 contract Plonk4VerifierWithAccessToDNext {
+    uint256 constant r_mod = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
+
     using PairingsBn254 for PairingsBn254.G1Point;
     using PairingsBn254 for PairingsBn254.G2Point;
     using PairingsBn254 for PairingsBn254.Fr;
@@ -964,7 +966,7 @@ contract Plonk4VerifierWithAccessToDNext {
         uint8 max_valid_index,
         uint8[] memory recursive_vks_indexes,
         uint256[] memory individual_vks_inputs,
-        uint256[] memory subproofs_limbs
+        uint256[16] memory subproofs_limbs
     ) internal view returns (bool) {
         (uint256 recursive_input, PairingsBn254.G1Point[2] memory aggregated_g1s) = reconstruct_recursive_public_input(
             recursive_vks_root, max_valid_index, recursive_vks_indexes,
@@ -978,12 +980,35 @@ contract Plonk4VerifierWithAccessToDNext {
             return false;
         }
 
-        recursive_proof_part[0].point_add_assign(aggregated_g1s[0]);
-        recursive_proof_part[1].point_add_assign(aggregated_g1s[1]);
+        // aggregated_g1s = inner
+        // recursive_proof_part = outer
+        PairingsBn254.G1Point[2] memory combined = combine_inner_and_outer(aggregated_g1s, recursive_proof_part);
 
-        valid = PairingsBn254.pairingProd2(recursive_proof_part[0], PairingsBn254.P2(), recursive_proof_part[1], vk.g2_x);
+        valid = PairingsBn254.pairingProd2(combined[0], PairingsBn254.P2(), combined[1], vk.g2_x);
 
         return valid;
+    }
+
+    function combine_inner_and_outer(
+        PairingsBn254.G1Point[2] memory inner,
+        PairingsBn254.G1Point[2] memory outer
+    ) internal view returns (PairingsBn254.G1Point[2] memory result) {
+        // reuse the transcript primitive
+        TranscriptLibrary.Transcript memory transcript = TranscriptLibrary.new_transcript();
+        transcript.update_with_g1(inner[0]);
+        transcript.update_with_g1(inner[1]);
+        transcript.update_with_g1(outer[0]);
+        transcript.update_with_g1(outer[1]);
+        PairingsBn254.Fr memory challenge = transcript.get_challenge();
+        // 1 * inner + challenge * outer
+        result[0] = PairingsBn254.copy_g1(inner[0]);
+        result[1] = PairingsBn254.copy_g1(inner[1]);
+        PairingsBn254.G1Point memory tmp = outer[0].point_mul(challenge);
+        result[0].point_add_assign(tmp);
+        tmp = outer[1].point_mul(challenge);
+        result[1].point_add_assign(tmp);
+
+        return result;
     }
 
     function reconstruct_recursive_public_input(
@@ -991,7 +1016,7 @@ contract Plonk4VerifierWithAccessToDNext {
         uint8 max_valid_index,
         uint8[] memory recursive_vks_indexes,
         uint256[] memory individual_vks_inputs,
-        uint256[] memory subproofs_aggregated
+        uint256[16] memory subproofs_aggregated
     ) internal pure returns (uint256 recursive_input, PairingsBn254.G1Point[2] memory reconstructed_g1s) {
         assert(recursive_vks_indexes.length == individual_vks_inputs.length);
         bytes memory concatenated = abi.encodePacked(recursive_vks_root);
@@ -1004,7 +1029,7 @@ contract Plonk4VerifierWithAccessToDNext {
         uint256 input;
         for (uint256 i = 0; i < recursive_vks_indexes.length; i++) {
             input = individual_vks_inputs[i];
-//            assert(input < PairingsBn254.r_mod);
+            assert(input < r_mod);
             concatenated = abi.encodePacked(concatenated, input);
         }
 
@@ -1149,7 +1174,7 @@ contract VerifierWithDeserialize is Plonk4VerifierWithAccessToDNext {
         uint8 max_valid_index,
         uint8[] memory recursive_vks_indexes,
         uint256[] memory individual_vks_inputs,
-        uint256[] memory subproofs_limbs,
+        uint256[16] memory subproofs_limbs,
         VerificationKey memory vk
     ) public view returns (bool) {
         require(vk.num_inputs == public_inputs.length);
