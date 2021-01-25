@@ -1551,29 +1551,29 @@ mod test {
             proofs.push(proof);
         }
 
-        let num_proofs_limit = 40;
-
         let num_inputs = 1;
-        let num_proofs_to_check = num_proofs_limit;
         let tree_depth = 3;
 
+        let num_proofs_to_check = 2;
+
         // this is dummy
+        println!("Creating setup and verification key");
         let (vk_for_recursive_circut, setup) = create_recursive_circuit_vk_and_setup(
-            2,
+            num_proofs_to_check,
             num_inputs,
             tree_depth,
             &crs,
         ).expect("must create recursive circuit verification key");
 
-        let mut proofs_indexes_to_check = vec![2,3];
-        proofs_indexes_to_check.resize(num_proofs_limit, 0);
+        let proofs_indexes_to_check = vec![2,3];
+        assert_eq!(proofs_indexes_to_check.len(), num_proofs_to_check);
 
-        let mut proofs_to_check = vec![proofs[2].clone(), proofs[3].clone()];
-        let tmp = proofs[0].clone();
-        proofs_to_check.resize(num_proofs_limit, tmp.clone());
+        let proofs_to_check = vec![proofs[2].clone(), proofs[3].clone()];
+        assert_eq!(proofs_to_check.len(), num_proofs_to_check);
     
         let worker = Worker::new();
 
+        println!("Creating proof");
         let _ = proof_recursive_aggregate_for_zksync(
             tree_depth, 
             num_inputs, 
